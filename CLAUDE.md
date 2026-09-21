@@ -9,7 +9,7 @@ Plataforma de classificação de gastos corporativos com loop de aprendizado hum
 
 ```bash
 # Backend
-pip install -r requirements.txt
+uv venv -p 3.11 .venv && uv pip install -p .venv -r requirements.txt  # mesmo Python do Azure
 cp local.settings.json.example local.settings.json  # preencher secrets
 func start                    # Azure Functions local
 
@@ -19,9 +19,9 @@ cp .env.local.example .env.local
 npm run dev                   # http://localhost:3000
 
 # Testes — zero chamadas ao Grok/xAI
-python3 -m pytest tests/ -v                          # Backend (470 testes, ~9s)
+.venv/bin/python -m pytest tests/ -v                          # Backend (470 testes, ~9s)
 cd frontend && npx jest --verbose                     # Frontend (60 testes, ~3s)
-python3 -m pytest tests/ --cov=src --cov-report=term-missing  # Coverage
+.venv/bin/python -m pytest tests/ --cov=src --cov-report=term-missing  # Coverage
 ```
 
 ## Stack
@@ -159,6 +159,6 @@ ALLOWED_GROUP_ID=                # ID do grupo de segurança Azure AD (opcional 
 - Endpoints usam `AuthLevel.ANONYMOUS` — auth real é feita pelos decorators `@require_auth`/`@require_admin`
 - Cache ML in-memory — não persiste entre instâncias Functions
 - Circuit breaker e rate limiter são in-memory (per-instance) — não distribuídos
-- Python local (3.12) difere do runtime Azure (3.13) — monitorar compatibilidade
+- Runtime Azure é **Python 3.11** (Flex Consumption, `pg-ai-pi-spendai-api`) — o venv local deve usar 3.11 (`uv venv -p 3.11 .venv`); o 3.13 citado em `docs/migracao-consumption.md` é do app legado
 - **flock em CIFS (Azure File Share) pode retornar EACCES** em contenção de lock (POSIX permite "EACCES or EAGAIN") — `src/file_lock.py` trata como "lock ocupado" e re-tenta; `filelock` é **pinado** no requirements.txt porque o build remoto do deploy resolve a versão na hora e versões diferentes tratam EACCES de forma diferente (incidente 2026-06-12, ver `docs/postmortems/`)
 - **`visibilityTimeout` da queue (45min, host.json) é também o delay de retry de mensagem falhada** — worker que morre sem limpar estado deixa o job PROCESSING sem dono por até 45min (UI mostra 99%); locks de KB/config (`knowledge_base.py`, `project_manager.py`) ainda usam `FileLock` cru, sem o retry de EACCES (follow-up pendente)
