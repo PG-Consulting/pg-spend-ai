@@ -1,7 +1,9 @@
 """Tests for src.llm_classifier — fallback chunk size and prompt correctness."""
 
+import json
+
 import pytest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from src.llm_classifier import classify_items_with_llm
 import inspect
@@ -147,6 +149,182 @@ class TestMapCategoriesSemaphore:
         # Semáforo deve ter sido adquirido e liberado pelo menos 1 vez
         assert mock_sem.acquire.call_count >= 1
         assert mock_sem.release.call_count >= 1
+
+
+class TestResponseMapping:
+    def setup_method(self):
+        from src.llm_classifier import _CIRCUIT_BREAKER
+
+        _CIRCUIT_BREAKER.record_success()
+
+    @staticmethod
+    def classify(items, rows):
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(rows, ensure_ascii=False)}}],
+            "usage": {},
+        }
+        with patch(
+            "src.llm_classifier.get_azure_openai_config", return_value=FAKE_CONFIG
+        ), patch("src.llm_classifier.requests.post", return_value=response) as post:
+            results, _ = classify_items_with_llm(items)
+        return results, post.call_args.kwargs["json"]
+
+    def test_reversed_rows_are_mapped_by_item_id(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+        rows = [
+            {"item_id": "item_1", "item": items[1], "N1": "Software", "N4": "Licença"},
+            {"item_id": "item_0", "item": items[0], "N1": "Materiais", "N4": "Parafuso"},
+        ]
+
+        results, payload = self.classify(items, rows)
+
+        assert [result["N4"] for result in results] == ["Parafuso", "Licença"]
+        encoded_items = payload["messages"][1]["content"].split("\n", 1)[1]
+        assert json.loads(encoded_items) == [
+            {"item_id": "item_0", "item": items[0]},
+            {"item_id": "item_1", "item": items[1]},
+        ]
+        assert "item_id" in payload["messages"][0]["content"]
+
+    def test_omitted_id_falls_back_without_shifting_other_rows(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+
+        results, _ = self.classify(
+            items,
+            [{"item_id": "item_1", "item": items[1], "N1": "Software", "N4": "Licença"}],
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+        assert results[0]["confidence"] == 0.0
+        assert results[1]["N4"] == "Licença"
+
+    def test_duplicate_id_is_ambiguous_even_if_one_row_has_contradictory_text(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item_id": "item_0", "item": items[0], "N1": "A", "N4": "A"},
+                {"item_id": "item_0", "item": items[1], "N1": "B", "N4": "B"},
+                {"item_id": "item_1", "item": items[1], "N1": "Software", "N4": "Licença"},
+            ],
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+        assert results[1]["N4"] == "Licença"
+
+    def test_id_with_contradictory_item_does_not_fall_back_to_text(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item_id": "item_0", "item": items[1], "N1": "Wrong", "N4": "Wrong"},
+                {"item_id": "item_1", "item": items[1], "N1": "Software", "N4": "Licença"},
+            ],
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+        assert results[1]["N4"] == "Licença"
+
+    @pytest.mark.parametrize("invalid_id", [None, 0, ["item_0"], "unknown"])
+    def test_invalid_id_does_not_fall_back_to_matching_text(self, invalid_id):
+        item = "Parafuso M8"
+
+        results, _ = self.classify(
+            [item], [{"item_id": invalid_id, "item": item, "N1": "Wrong", "N4": "Wrong"}]
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+
+    def test_missing_id_in_mixed_response_is_not_matched_by_text(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item_id": "item_0", "item": items[0], "N1": "Materiais", "N4": "Parafuso"},
+                {"item": items[1], "N1": "Software", "N4": "Licença"},
+            ],
+        )
+
+        assert results[0]["N4"] == "Parafuso"
+        assert results[1]["N1"] == "Não Identificado"
+
+    def test_repeated_descriptions_are_disambiguated_by_id(self):
+        items = ["Assinatura mensal", "Assinatura mensal"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item_id": "item_1", "item": items[1], "N1": "B", "N4": "B"},
+                {"item_id": "item_0", "item": items[0], "N1": "A", "N4": "A"},
+            ],
+        )
+
+        assert [result["N4"] for result in results] == ["A", "B"]
+
+    def test_legacy_exact_text_maps_uniquely_without_ids(self):
+        items = ["Parafuso M8", "Licença anual de software"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item": items[1], "N1": "Software", "N4": "Licença"},
+                {"item": items[0], "N1": "Materiais", "N4": "Parafuso"},
+            ],
+        )
+
+        assert [result["N4"] for result in results] == ["Parafuso", "Licença"]
+
+    def test_legacy_single_unlabelled_object_remains_valid(self):
+        results, _ = self.classify(
+            ["Licença anual de software"],
+            {"N1": "Software", "N4": "Licença"},
+        )
+
+        assert results[0]["N4"] == "Licença"
+
+    def test_repeated_legacy_descriptions_are_ambiguous(self):
+        items = ["Assinatura mensal", "Assinatura mensal"]
+
+        results, _ = self.classify(
+            items,
+            [
+                {"item": items[0], "N1": "A", "N4": "A"},
+                {"item": items[1], "N1": "B", "N4": "B"},
+            ],
+        )
+
+        assert [result["N1"] for result in results] == [
+            "Não Identificado",
+            "Não Identificado",
+        ]
+
+    def test_duplicate_legacy_response_rows_are_ambiguous(self):
+        item = "Parafuso M8"
+
+        results, _ = self.classify(
+            [item],
+            [
+                {"item": item, "N1": "A", "N4": "A"},
+                {"item": item, "N1": "B", "N4": "B"},
+            ],
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+
+    def test_legacy_substring_match_is_rejected(self):
+        items = ["Parafuso M8", "Parafuso M8 zincado"]
+
+        results, _ = self.classify(
+            items,
+            [{"item": items[1], "N1": "Fixadores", "N4": "Parafuso zincado"}],
+        )
+
+        assert results[0]["N1"] == "Não Identificado"
+        assert results[1]["N4"] == "Parafuso zincado"
 
 
 class TestWebSearchDoesNotBreakClassification:

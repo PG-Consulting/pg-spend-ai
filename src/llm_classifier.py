@@ -14,7 +14,7 @@ from typing import List, Dict, Optional, Tuple, Union
 
 from src.types import ClassificationResultDict, HierarchyEntryDict, KBEntryDict
 from src.exceptions import BillingError
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -382,7 +382,7 @@ def _call_openai_api_inner(
             "ATENÇÃO: Se o contexto acima contiver 'Regras' ou instruções específicas, "
             "aplique-as com prioridade máxima sobre seu conhecimento geral.\n\n"
             "FORMATO DE SAÍDA: Retorne APENAS JSON array (sem markdown).\n"
-            'Exemplo: [{"item": "...", "N1": "...", "N2": "...", "N3": "...", "N4": "...", "confidence": 0.9}]\n\n'
+            'Exemplo: [{"item_id": "item_0", "item": "...", "N1": "...", "N2": "...", "N3": "...", "N4": "...", "confidence": 0.9}]\n\n'
             f"ÁRVORE DE CATEGORIAS DO CLIENTE (cada linha prefixada com [N1], [N2], [N3] ou [N4]):\n"
             f"{compact_tree}\n\n"
             "RESTRIÇÕES OBRIGATÓRIAS:\n"
@@ -411,7 +411,7 @@ def _call_openai_api_inner(
             "Analise cada palavra antes de decidir para desambiguar contextos.\n"
             "IMPORTANTE: Retorne a resposta APENAS no formato JSON abaixo (array de objetos), sem markdown. "
             "Exemplo de Saída:\n"
-            '[{"item": "Tubo PVC 10mm", "N1": "MRO", "N2": "Materiais de Construção", "N3": "Produtos Sanitários", "N4": "Tubos", "confidence": 0.95}, ...]'
+            '[{"item_id": "item_0", "item": "Tubo PVC 10mm", "N1": "MRO", "N2": "Materiais de Construção", "N3": "Produtos Sanitários", "N4": "Tubos", "confidence": 0.95}, ...]'
         )
 
     # Add few-shot examples if provided
@@ -438,6 +438,12 @@ def _call_openai_api_inner(
             f"{user_instruction}\n"
         )
 
+    system_message += (
+        "\n\nIDENTIFICAÇÃO DOS ITENS: cada entrada tem um `item_id` único. "
+        "Retorne exatamente um objeto por entrada, copiando `item_id` e `item` "
+        "sem alteração. Não omita, duplique nem invente IDs."
+    )
+
     # Web search foi descontinuado pela xAI: a Live Search retorna HTTP 410
     # ("deprecated, switch to Agent Tools API") e o antigo
     # tools:[{"type":"web_search"}] é rejeitado com HTTP 422. Quando ligado,
@@ -449,8 +455,13 @@ def _call_openai_api_inner(
             "xAI; classificando sem busca na internet (degradação segura)"
         )
 
-    user_content = "Classifique os seguintes itens:\n" + "\n".join(
-        [f"- {item}" for item in items]
+    user_items = [
+        {"item_id": f"item_{idx}", "item": item}
+        for idx, item in enumerate(items)
+    ]
+    user_content = (
+        "Classifique todos os itens. Preserve exatamente os campos `item_id` e `item`:\n"
+        + json.dumps(user_items, ensure_ascii=False)
     )
 
     payload = {
@@ -603,37 +614,51 @@ def _call_openai_api_inner(
                 _create_manual_fallback(item, "Formato inesperado") for item in items
             ], token_usage
 
-        # Map back to results
-        formatted_results = []
+        # Map by the per-call ID. Accept older responses only when an exact
+        # description uniquely identifies one input and one response row.
+        response_rows = [row for row in parsed if isinstance(row, dict)]
+        has_ids = any("item_id" in row for row in response_rows)
+        matches = [None] * len(items)
 
-        # For batch processing, try to match results to input items
-        for idx, item_text in enumerate(items):
-            match = None
-
-            # Try multiple matching strategies:
-            # 1. Match by index (if LLM preserved order)
-            if idx < len(parsed):
-                candidate = parsed[idx]
-                if candidate.get("N1") or candidate.get("N2"):
-                    match = candidate
-
-            # 2. Match by item text in response
-            if not match:
+        if has_ids:
+            id_counts = Counter(
+                row["item_id"]
+                for row in response_rows
+                if isinstance(row.get("item_id"), str)
+            )
+            for idx, item_text in enumerate(items):
+                item_id = f"item_{idx}"
+                if id_counts[item_id] != 1:
+                    continue
                 match = next(
-                    (
-                        r
-                        for r in parsed
-                        if r.get("item") == item_text
-                        or item_text in str(r.get("item", ""))
-                    ),
-                    None,
+                    row for row in response_rows if row.get("item_id") == item_id
                 )
+                if "item" in match and match["item"] != item_text:
+                    continue
+                matches[idx] = match
+        else:
+            input_counts = Counter(items)
+            rows_by_item = defaultdict(list)
+            unlabelled_rows = []
+            for row in response_rows:
+                if isinstance(row.get("item"), str):
+                    rows_by_item[row["item"]].append(row)
+                elif "item" not in row:
+                    unlabelled_rows.append(row)
 
-            # 3. Use first unmatched result (fallback)
-            if not match and len(parsed) > 0:
-                match = parsed[0]
-                parsed = parsed[1:]  # Remove used result
+            for idx, item_text in enumerate(items):
+                item_rows = rows_by_item[item_text]
+                if input_counts[item_text] == 1 and len(item_rows) == 1:
+                    matches[idx] = item_rows[0]
+                elif (
+                    len(items) == 1
+                    and len(parsed) == 1
+                    and len(unlabelled_rows) == 1
+                ):
+                    matches[idx] = unlabelled_rows[0]
 
+        formatted_results = []
+        for item_text, match in zip(items, matches):
             if match and (match.get("N1") or match.get("N2")):
                 formatted_results.append(
                     {
